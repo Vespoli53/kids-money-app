@@ -1,4 +1,5 @@
 import calendar
+import hashlib
 from datetime import date, datetime, timedelta
 
 import pandas as pd
@@ -54,8 +55,8 @@ select,
     padding-bottom: 2rem;
     max-width: 760px;
 }
-h1 {
-    font-size: 2.0rem !important;
+h1 { white-space: nowrap;
+    font-size: 1.6rem !important;
     margin-bottom: .25rem;
 }
 .kid-card {
@@ -149,7 +150,7 @@ div.stButton > button {
     border-color: rgba(250,250,250,.45);
 }
 
-.block-container h1 {
+.block-container h1 { white-space: nowrap;
     margin-bottom: 0.75rem !important;
 }
 
@@ -619,6 +620,31 @@ div.stButton > button [data-testid="stMarkdownContainer"] p {
     line-height: 1;
 }
 
+
+/* PIN entry */
+.pin-title {
+    font-size: 0.72rem;
+    font-weight: 800;
+    letter-spacing: 0.05em;
+    color: rgba(255,255,255,.66);
+    margin: 0.25rem 0 0.45rem 0;
+    text-transform: uppercase;
+}
+div[data-testid="stTextInput"]:has(input[aria-label="PIN"]) {
+    max-width: 150px !important;
+}
+div[data-testid="stTextInput"]:has(input[aria-label="PIN"]) input {
+    width: 150px !important;
+    min-height: 38px !important;
+    height: 38px !important;
+    text-align: center !important;
+}
+
+
+/* Hide Streamlit header (deploy + menu) */
+header {visibility: hidden;}
+div[data-testid="stToolbar"] {visibility: hidden;}
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -636,6 +662,51 @@ def run_query(sql, params=None):
     engine = get_engine()
     with engine.begin() as conn:
         return conn.execute(text(sql), params or {})
+
+
+
+def get_auth_token():
+    app_pin = str(st.secrets.get("APP_PIN", "")).strip()
+    return hashlib.sha256(f"kids-money-app::{app_pin}".encode("utf-8")).hexdigest()[:24]
+
+
+def require_pin():
+    app_pin = str(st.secrets.get("APP_PIN", "")).strip()
+
+    if not app_pin:
+        st.error("APP_PIN is missing from Streamlit secrets.")
+        st.stop()
+
+    auth_token = get_auth_token()
+    current_token = str(st.query_params.get("auth", "")).strip()
+
+    if st.session_state.get("pin_authenticated", False) or current_token == auth_token:
+        st.session_state.pin_authenticated = True
+        if current_token != auth_token:
+            st.query_params["auth"] = auth_token
+        return
+
+    st.markdown("<h1>PIERCE FAMILY ALLOWANCE</h1>", unsafe_allow_html=True)
+    st.markdown('<div class="pin-title">ENTER PIN</div>', unsafe_allow_html=True)
+
+    entered_pin = st.text_input(
+        "PIN",
+        type="password",
+        label_visibility="collapsed",
+        placeholder="PIN",
+        key="pin_entry",
+    )
+
+    if st.button("ENTER", key="pin_enter_button"):
+        if entered_pin == app_pin:
+            st.session_state.pin_authenticated = True
+            st.session_state.pop("pin_entry", None)
+            st.query_params["auth"] = auth_token
+            st.rerun()
+        else:
+            st.warning("Incorrect PIN.")
+
+    st.stop()
 
 
 def load_kids():
@@ -777,8 +848,8 @@ def add_ledger(kid, entry_type, amount, from_bucket=None, to_bucket=None, commen
 
 
 def is_allowance_day(d):
-    last_day = calendar.monthrange(d.year, d.month)[1]
-    return d.day == 15 or d.day == last_day
+    # Sunday = 6 in Python's weekday() convention.
+    return d.weekday() == 6
 
 
 def allowance_periods_due():
@@ -844,7 +915,10 @@ def render_nav(current_page):
     for label, page_name in nav_items:
         active = " active" if current_page == page_name else ""
         href_page = page_name.replace(" ", "%20")
-        links.append(f'<a class="nav-pill{active}" href="?page={href_page}" target="_self">{label}</a>')
+        auth_part = ""
+        if st.session_state.get("pin_authenticated", False):
+            auth_part = f"&auth={get_auth_token()}"
+        links.append(f'<a class="nav-pill{active}" href="?page={href_page}{auth_part}" target="_self">{label}</a>')
 
     st.markdown(f'<div class="nav-wrap">{"".join(links)}</div>', unsafe_allow_html=True)
 
@@ -892,7 +966,10 @@ def kid_picker(kids, label="Which kid?"):
     return kids.iloc[kid_labels.index(selected_label)]
 
 
-# Auto-post silently on app open.
+# Require PIN before loading data or posting allowance.
+require_pin()
+
+# Auto-post silently on app open after successful PIN entry.
 auto_post_allowance_on_open()
 
 kids = load_kids()
@@ -918,7 +995,7 @@ if page == "HOME":
                     <div class="big-icon">{kid['icon']}</div>
                     <div>
                         <div class="kid-name">{kid['name']}</div>
-                        <div class="small-muted">${float(kid['allowance']):,.2f} twice monthly</div>
+                        <div class="small-muted">${float(kid['allowance']):,.2f} weekly</div>
                     </div>
                 </div>
                 <div class="balance-row">
