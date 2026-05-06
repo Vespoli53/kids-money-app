@@ -1,5 +1,6 @@
 import calendar
 import hashlib
+import time
 from datetime import date, datetime, timedelta
 
 import pandas as pd
@@ -17,6 +18,29 @@ st.set_page_config(
 
 st.markdown("""
 <style>
+
+
+:root {
+    color-scheme: dark !important;
+}
+
+html, body, [data-testid="stAppViewContainer"], .stApp, section.main {
+    background: #0e1117 !important;
+    color: rgba(255,255,255,.92) !important;
+}
+
+[data-testid="stAppViewContainer"] > .main {
+    background: #0e1117 !important;
+}
+
+[data-testid="stSidebar"] {
+    background: #0e1117 !important;
+}
+
+[data-testid="stHeader"] {
+    background: #0e1117 !important;
+}
+
 
 /* ===== GLOBAL FONT OVERRIDE ===== */
 @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700;800;900&display=swap');
@@ -655,13 +679,20 @@ def get_engine():
     if not db_url:
         st.error("DATABASE_URL is missing from .streamlit/secrets.toml.")
         st.stop()
-    return create_engine(db_url, pool_pre_ping=True)
+    return create_engine(db_url, pool_pre_ping=True, pool_recycle=300)
 
 
-def run_query(sql, params=None):
+def run_query(sql, params=None, retries=3, delay=2):
     engine = get_engine()
-    with engine.begin() as conn:
-        return conn.execute(text(sql), params or {})
+
+    for attempt in range(retries):
+        try:
+            with engine.begin() as conn:
+                return conn.execute(text(sql), params or {})
+        except Exception as e:
+            if attempt == retries - 1:
+                raise
+            time.sleep(delay)
 
 
 
@@ -852,18 +883,44 @@ def is_allowance_day(d):
     return d.weekday() == 6
 
 
-def allowance_periods_due():
+def get_last_allowance_posted():
     engine = get_engine()
 
     with engine.begin() as conn:
-        last_posted = conn.execute(
-            text("select max(period_date) from public.allowance_postings")
+        return conn.execute(
+            text(
+                """
+                select max(entry_date)
+                from public.ledger
+                where entry_type = 'Allowance'
+                """
+            )
         ).scalar()
 
+
+def get_next_allowance_due_date(last_posted=None):
     today = date.today()
 
     if last_posted is None:
-        # Start with the most recent allowance date on or before today.
+        last_posted = get_last_allowance_posted()
+
+    if last_posted is None:
+        check = today
+        while not is_allowance_day(check):
+            check -= timedelta(days=1)
+        return check
+
+    check = last_posted + timedelta(days=1)
+    while not is_allowance_day(check):
+        check += timedelta(days=1)
+    return check
+
+
+def allowance_periods_due():
+    last_posted = get_last_allowance_posted()
+    today = date.today()
+
+    if last_posted is None:
         check = today
         while not is_allowance_day(check):
             check -= timedelta(days=1)
@@ -881,16 +938,86 @@ def allowance_periods_due():
     return periods
 
 
-def auto_post_allowance_on_open():
-    periods = allowance_periods_due()
+def post_weekly_allowance_for_period(period_date):
+    if not is_allowance_day(period_date):
+        raise ValueError(f"Allowance period must be a Sunday. Got {period_date}")
 
-    for period in periods:
-        run_query(
-            "select public.post_allowance_for_period(:period_date)",
-            {"period_date": period},
+    kids_df = load_kids()
+    engine = get_engine()
+
+    posting_exists_sql = text(
+        """
+        select 1
+        from public.ledger
+        where kid_id = :kid_id
+          and entry_date = :period_date
+          and entry_type = 'Allowance'
+        limit 1
+        """
+    )
+    ledger_insert_sql = text(
+        """
+        insert into public.ledger (
+            entry_date, kid_id, entry_type, amount, from_bucket, to_bucket, comment
         )
+        values (
+            :entry_date, :kid_id, 'Allowance', :amount, :from_bucket, :to_bucket, :comment
+        )
+        """
+    )
 
-    return periods
+    posted_any = False
+
+    with engine.begin() as conn:
+        for _, kid in kids_df.iterrows():
+            kid_id = str(kid["kid_id"])
+            allowance = round(float(kid.get("allowance", 0) or 0), 2)
+            save_percent = float(kid.get("save_percent", 0) or 0)
+
+            if allowance == 0:
+                continue
+
+            already_posted = conn.execute(
+                posting_exists_sql,
+                {"kid_id": kid_id, "period_date": period_date},
+            ).scalar()
+
+            if already_posted:
+                continue
+
+            save_amount = round(allowance * (save_percent / 100.0), 2)
+            spend_amount = round(allowance - save_amount, 2)
+            comment = f"Weekly allowance for {period_date.isoformat()}"
+
+            if spend_amount != 0:
+                conn.execute(
+                    ledger_insert_sql,
+                    {
+                        "entry_date": period_date,
+                        "kid_id": kid_id,
+                        "amount": spend_amount,
+                        "from_bucket": None,
+                        "to_bucket": "Spend",
+                        "comment": comment,
+                    },
+                )
+
+            if save_amount != 0:
+                conn.execute(
+                    ledger_insert_sql,
+                    {
+                        "entry_date": period_date,
+                        "kid_id": kid_id,
+                        "amount": save_amount,
+                        "from_bucket": None,
+                        "to_bucket": "Save",
+                        "comment": comment,
+                    },
+                )
+
+            posted_any = True
+
+    return posted_any
 
 
 def get_current_page():
@@ -934,6 +1061,38 @@ def parse_amount(value):
 
 
 
+
+
+def format_short_date(d):
+    if not d:
+        return ""
+    return f"{d.month}/{d.day}/{d.year}"
+
+
+
+def reset_activity_form():
+    st.session_state.activity_action = None
+    st.session_state.activity_form_nonce = st.session_state.get("activity_form_nonce", 0) + 1
+    base_keys = [
+        "transfer_amount_text",
+        "transfer_comment",
+        "transfer_kid_radio",
+        "transfer_from_bucket_radio",
+        "bonus_amount_text",
+        "bonus_comment",
+        "bonus_kid_radio",
+        "bonus_bucket_radio",
+        "adjustment_amount_text",
+        "adjustment_comment",
+        "adjustment_kid_radio",
+        "adjustment_bucket_radio",
+    ]
+    for key in list(st.session_state.keys()):
+        if key == "activity_action_radio" or key.startswith("activity_action_radio_"):
+            st.session_state.pop(key, None)
+    for key in base_keys:
+        st.session_state.pop(key, None)
+
 def render_selected_kid_balances(kid_id):
     current = balances[balances["kid_id"].astype(str) == str(kid_id)]
     if current.empty:
@@ -969,13 +1128,44 @@ def kid_picker(kids, label="Which kid?"):
 # Require PIN before loading data or posting allowance.
 require_pin()
 
-# Auto-post silently on app open after successful PIN entry.
-auto_post_allowance_on_open()
-
 kids = load_kids()
 balances = load_balances()
 
 st.markdown("<h1>PIERCE FAMILY ALLOWANCE</h1>", unsafe_allow_html=True)
+
+last_allowance_posted = get_last_allowance_posted()
+next_allowance_due = get_next_allowance_due_date(last_allowance_posted)
+periods_due = allowance_periods_due()
+
+status_parts = []
+if last_allowance_posted:
+    status_parts.append(f"Last posted: {format_short_date(last_allowance_posted)}")
+status_parts.append(f"Next due: {format_short_date(next_allowance_due)}")
+
+if periods_due:
+    st.warning(f"{len(periods_due)} allowance period(s) due. " + " | ".join(status_parts))
+else:
+    st.caption(" | ".join(status_parts))
+
+if st.button("POST ALLOWANCE", key="post_allowance_button"):
+    try:
+        if not periods_due:
+            st.info("No allowance periods due.")
+        else:
+            posted_count = 0
+
+            for period in periods_due:
+                if post_weekly_allowance_for_period(period):
+                    posted_count += 1
+
+            if posted_count:
+                st.success(f"Allowance posted for {posted_count} period(s).")
+                st.rerun()
+            else:
+                st.info("No allowance periods due.")
+    except Exception as e:
+        st.error("Allowance posting failed. Try again.")
+        print("POST ALLOWANCE ERROR:", e)
 
 page = get_current_page()
 render_nav(page)
@@ -1023,8 +1213,11 @@ elif page == "ACTIVITY":
 
     if "activity_action" not in st.session_state:
         st.session_state.activity_action = None
+    if "activity_form_nonce" not in st.session_state:
+        st.session_state.activity_form_nonce = 0
 
     if st.session_state.pop("activity_saved", False):
+        reset_activity_form()
         st.success("Transaction saved.")
 
     if kids.empty:
@@ -1043,7 +1236,7 @@ elif page == "ACTIVITY":
             index=index,
             horizontal=True,
             label_visibility="collapsed",
-            key="activity_action_radio",
+            key=f"activity_action_radio_{st.session_state.activity_form_nonce}",
         )
 
         action = selected_action.title() if selected_action else None
@@ -1084,9 +1277,7 @@ elif page == "ACTIVITY":
                         st.warning("Enter a valid amount.")
                     elif add_ledger(kid, "Transfer", amount, from_bucket=from_bucket, to_bucket=to_bucket, comment=comment):
                         st.session_state.activity_saved = True
-                        st.session_state.activity_action = None
-                        for key in ["activity_action_radio", "transfer_amount_text", "transfer_comment", "transfer_kid_radio"]:
-                            st.session_state.pop(key, None)
+                        reset_activity_form()
                         st.rerun()
                     else:
                         st.warning("Enter an amount before saving.")
@@ -1109,9 +1300,7 @@ elif page == "ACTIVITY":
                         st.warning("Enter a valid amount.")
                     elif add_ledger(kid, "Bonus", amount, to_bucket=bucket, comment=comment):
                         st.session_state.activity_saved = True
-                        st.session_state.activity_action = None
-                        for key in ["activity_action_radio", "bonus_amount_text", "bonus_comment", "bonus_kid_radio"]:
-                            st.session_state.pop(key, None)
+                        reset_activity_form()
                         st.rerun()
                     else:
                         st.warning("Enter an amount before saving.")
@@ -1134,9 +1323,7 @@ elif page == "ACTIVITY":
                         st.warning("Enter a valid amount.")
                     elif add_ledger(kid, "Adjustment", amount, to_bucket=bucket, comment=comment):
                         st.session_state.activity_saved = True
-                        st.session_state.activity_action = None
-                        for key in ["activity_action_radio", "adjustment_amount_text", "adjustment_comment", "adjustment_kid_radio"]:
-                            st.session_state.pop(key, None)
+                        reset_activity_form()
                         st.rerun()
                     else:
                         st.warning("Enter a positive or negative amount before saving.")
