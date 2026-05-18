@@ -761,17 +761,33 @@ def load_balances():
     engine = get_engine()
     query = """
         select
-            kid_id::text as kid_id,
-            display_order,
-            name,
-            icon,
-            twice_monthly_allowance as allowance,
-            save_percent,
-            spend_balance,
-            save_balance,
-            0::numeric as investment_balance
-        from public.kid_balances
-        order by display_order, name
+            kb.kid_id::text as kid_id,
+            kb.display_order,
+            kb.name,
+            kb.icon,
+            kb.twice_monthly_allowance as allowance,
+            kb.save_percent,
+            kb.spend_balance,
+            kb.save_balance,
+            coalesce(h.hustle_balance, 0)::numeric as hustle_balance
+        from public.kid_balances kb
+        left join (
+            select
+                kid_id,
+                sum(
+                    case
+                        when to_bucket in ('Hustle', 'Investment', 'Invest') then amount
+                        when from_bucket in ('Hustle', 'Investment', 'Invest') then -amount
+                        else 0
+                    end
+                ) as hustle_balance
+            from public.ledger
+            where to_bucket in ('Hustle', 'Investment', 'Invest')
+               or from_bucket in ('Hustle', 'Investment', 'Invest')
+            group by kid_id
+        ) h
+            on h.kid_id = kb.kid_id
+        order by kb.display_order, kb.name
     """
     return pd.read_sql(query, engine)
 
@@ -1098,9 +1114,11 @@ def render_selected_kid_balances(kid_id):
     if current.empty:
         spend = 0.0
         save = 0.0
+        hustle = 0.0
     else:
         spend = float(current.iloc[0]["spend_balance"])
         save = float(current.iloc[0]["save_balance"])
+        hustle = float(current.iloc[0].get("hustle_balance", 0) or 0)
 
     st.markdown(
         f"""
@@ -1112,6 +1130,10 @@ def render_selected_kid_balances(kid_id):
             <div class="selected-kid-balance-box">
                 <div class="selected-kid-balance-label">Save</div>
                 <div class="selected-kid-balance-value">${save:,.2f}</div>
+            </div>
+            <div class="selected-kid-balance-box">
+                <div class="selected-kid-balance-label">Hustle</div>
+                <div class="selected-kid-balance-value">${hustle:,.2f}</div>
             </div>
         </div>
         """,
@@ -1176,7 +1198,7 @@ if page == "HOME":
     for _, kid in balances.iterrows():
         spend = float(kid["spend_balance"])
         save = float(kid["save_balance"])
-        investment = float(kid.get("investment_balance", 0) or 0)
+        hustle = float(kid.get("hustle_balance", 0) or 0)
 
         st.markdown(
             f"""
@@ -1198,8 +1220,8 @@ if page == "HOME":
                         <div class="balance">${save:,.2f}</div>
                     </div>
                     <div class="balance-box">
-                        <div class="balance-label">Investment</div>
-                        <div class="balance">${investment:,.2f}</div>
+                        <div class="balance-label">Hustle</div>
+                        <div class="balance">${hustle:,.2f}</div>
                     </div>
                 </div>
             </div>
@@ -1309,7 +1331,7 @@ elif page == "ACTIVITY":
                 st.markdown('<div class="detail-radio-anchor"></div>', unsafe_allow_html=True)
                 bucket = st.radio(
                     "Bucket",
-                    ["Spend", "Save"],
+                    ["Spend", "Save", "Hustle"],
                     horizontal=True,
                     key="adjustment_bucket_radio",
                 )
