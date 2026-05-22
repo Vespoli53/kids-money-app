@@ -8,6 +8,8 @@ import streamlit as st
 from sqlalchemy import create_engine, text
 
 
+APP_BUILD = "hustle-adjustment-v4-clean-check-2026-05-22"
+
 st.set_page_config(
     page_title="Pierce Family Allowance",
     page_icon="",
@@ -645,6 +647,14 @@ div.stButton > button [data-testid="stMarkdownContainer"] p {
 }
 
 
+/* Small build tag for deployment verification */
+.build-tag {
+    color: rgba(255,255,255,.35);
+    font-size: 0.62rem;
+    margin-top: -0.55rem;
+    margin-bottom: 0.55rem;
+}
+
 /* PIN entry */
 .pin-title {
     font-size: 0.72rem;
@@ -1187,6 +1197,7 @@ kids = load_kids()
 balances = load_balances()
 
 st.markdown("<h1>PIERCE FAMILY ALLOWANCE</h1>", unsafe_allow_html=True)
+st.markdown(f'<div class="build-tag">Build: {APP_BUILD}</div>', unsafe_allow_html=True)
 
 last_allowance_posted = get_last_allowance_posted()
 next_allowance_due = get_next_allowance_due_date(last_allowance_posted)
@@ -1273,7 +1284,8 @@ elif page == "ACTIVITY":
 
     if st.session_state.pop("activity_saved", False):
         reset_activity_form()
-        st.success("Transaction saved.")
+        saved_msg = st.session_state.pop("activity_saved_message", "Transaction saved.")
+        st.success(saved_msg)
 
     if kids.empty:
         st.warning("Add at least one kid in Family Settings first.")
@@ -1327,7 +1339,7 @@ elif page == "ACTIVITY":
                 amount = parse_amount(amount_text)
                 comment = st.text_input("Comment", value="", key="transfer_comment")
 
-                if st.button("SAVE"):
+                if st.button("SAVE", key="transfer_save_button"):
                     if amount is None:
                         st.warning("Enter a valid amount.")
                     elif add_ledger(kid, "Transfer", amount, from_bucket=from_bucket, to_bucket=to_bucket, comment=comment):
@@ -1350,7 +1362,7 @@ elif page == "ACTIVITY":
                 amount = parse_amount(amount_text)
                 comment = st.text_input("Comment", value="", key="bonus_comment")
 
-                if st.button("SAVE"):
+                if st.button("SAVE", key="bonus_save_button"):
                     if amount is None:
                         st.warning("Enter a valid amount.")
                     elif add_ledger(kid, "Bonus", amount, to_bucket=bucket, comment=comment):
@@ -1373,15 +1385,20 @@ elif page == "ACTIVITY":
                 amount = parse_amount(amount_text)
                 comment = st.text_input("Comment", value="", key="adjustment_comment")
 
-                if st.button("SAVE"):
+                if st.button("SAVE", key="adjustment_save_button"):
                     if amount is None:
                         st.warning("Enter a valid amount.")
-                    elif add_ledger(kid, "Adjustment", amount, to_bucket=bucket, comment=comment):
-                        st.session_state.activity_saved = True
-                        reset_activity_form()
-                        st.rerun()
                     else:
-                        st.warning("Enter a positive or negative amount before saving.")
+                        db_bucket = bucket_to_db(bucket)
+                        saved = add_ledger(kid, "Adjustment", amount, to_bucket=db_bucket, comment=comment)
+
+                        if saved:
+                            st.session_state.activity_saved = True
+                            st.session_state.activity_saved_message = f"Saved {bucket} adjustment of ${amount:,.2f}."
+                            reset_activity_form()
+                            st.rerun()
+                        else:
+                            st.warning("Enter a positive or negative amount before saving.")
 
 elif page == "FAMILY SETTINGS":
     
@@ -1405,7 +1422,7 @@ elif page == "FAMILY SETTINGS":
         disabled=["kid_id"],
     )
 
-    if st.button("SAVE"):
+    if st.button("SAVE", key="family_settings_save_button"):
         save_kids(edited)
         st.success("Family settings saved.")
         st.rerun()
