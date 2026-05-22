@@ -802,8 +802,14 @@ def load_ledger():
             k.name as kid_name,
             l.entry_type,
             l.amount,
-            coalesce(l.from_bucket, '') as from_bucket,
-            coalesce(l.to_bucket, '') as to_bucket,
+            case
+                when l.from_bucket in ('Hustle', 'Investment', 'Invest') then 'Hustle'
+                else coalesce(l.from_bucket, '')
+            end as from_bucket,
+            case
+                when l.to_bucket in ('Hustle', 'Investment', 'Invest') then 'Hustle'
+                else coalesce(l.to_bucket, '')
+            end as to_bucket,
             coalesce(l.comment, '') as comment
         from public.ledger l
         join public.kids k
@@ -868,6 +874,8 @@ def save_kids(edited_df):
 
 def add_ledger(kid, entry_type, amount, from_bucket=None, to_bucket=None, comment=""):
     amount = float(amount)
+    from_bucket = bucket_to_db(from_bucket) if from_bucket else None
+    to_bucket = bucket_to_db(to_bucket) if to_bucket else None
 
     if amount == 0:
         return False
@@ -1074,6 +1082,31 @@ def parse_amount(value):
         return round(float(cleaned), 2)
     except ValueError:
         return None
+
+
+# Keep the database bucket value as Invest for compatibility with the existing
+# ledger constraints/views, but show Hustle in the UI.
+BUCKET_DISPLAY_LABELS = {
+    "Invest": "Hustle",
+    "Investment": "Hustle",
+    "Hustle": "Hustle",
+}
+
+BUCKET_DB_VALUES = {
+    "Spend": "Spend",
+    "Save": "Save",
+    "Hustle": "Invest",
+    "Invest": "Invest",
+    "Investment": "Invest",
+}
+
+
+def bucket_to_db(bucket):
+    return BUCKET_DB_VALUES.get(bucket, bucket)
+
+
+def bucket_to_display(bucket):
+    return BUCKET_DISPLAY_LABELS.get(bucket, bucket)
 
 
 
