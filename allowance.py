@@ -1,5 +1,6 @@
 import calendar
 import hashlib
+import re
 import time
 from datetime import date, datetime, timedelta
 
@@ -8,14 +9,14 @@ import streamlit as st
 from sqlalchemy import create_engine, text
 
 
-APP_BUILD = "hustle-adjustment-v4-clean-check-2026-05-22"
-
 st.set_page_config(
     page_title="Pierce Family Allowance",
     page_icon="",
     layout="centered",
     initial_sidebar_state="collapsed",
 )
+
+APP_BUILD = "hustle-adjustment-v10-transfer-rule-schema-fix-2026-05-27"
 
 
 st.markdown("""
@@ -647,14 +648,6 @@ div.stButton > button [data-testid="stMarkdownContainer"] p {
 }
 
 
-/* Small build tag for deployment verification */
-.build-tag {
-    color: rgba(255,255,255,.35);
-    font-size: 0.62rem;
-    margin-top: -0.55rem;
-    margin-bottom: 0.55rem;
-}
-
 /* PIN entry */
 .pin-title {
     font-size: 0.72rem;
@@ -812,14 +805,8 @@ def load_ledger():
             k.name as kid_name,
             l.entry_type,
             l.amount,
-            case
-                when l.from_bucket in ('Hustle', 'Investment', 'Invest') then 'Hustle'
-                else coalesce(l.from_bucket, '')
-            end as from_bucket,
-            case
-                when l.to_bucket in ('Hustle', 'Investment', 'Invest') then 'Hustle'
-                else coalesce(l.to_bucket, '')
-            end as to_bucket,
+            coalesce(l.from_bucket, '') as from_bucket,
+            coalesce(l.to_bucket, '') as to_bucket,
             coalesce(l.comment, '') as comment
         from public.ledger l
         join public.kids k
@@ -884,8 +871,6 @@ def save_kids(edited_df):
 
 def add_ledger(kid, entry_type, amount, from_bucket=None, to_bucket=None, comment=""):
     amount = float(amount)
-    from_bucket = bucket_to_db(from_bucket) if from_bucket else None
-    to_bucket = bucket_to_db(to_bucket) if to_bucket else None
 
     if amount == 0:
         return False
@@ -1094,29 +1079,106 @@ def parse_amount(value):
         return None
 
 
-# Keep the database bucket value as Invest for compatibility with the existing
-# ledger constraints/views, but show Hustle in the UI.
-BUCKET_DISPLAY_LABELS = {
-    "Invest": "Hustle",
-    "Investment": "Hustle",
-    "Hustle": "Hustle",
-}
+def ensure_hustle_bucket_schema():
+    """Make sure the ledger constraints match the app's Hustle bucket behavior.
 
-BUCKET_DB_VALUES = {
-    "Spend": "Spend",
-    "Save": "Save",
-    "Hustle": "Invest",
-    "Invest": "Invest",
-    "Investment": "Invest",
-}
+    There are two separate database rules involved:
+    1. ledger_bucket_check controls which bucket names are allowed.
+    2. ledger_transfer_rules controls which entry types may use from_bucket/to_bucket.
+
+    Hustle must be allowed by both rules. Adjustment rows always use to_bucket
+    with a signed amount. Positive adjustments increase the bucket; negative
+    adjustments reduce it. They do not use from_bucket.
+    """
+    valid_bucket_sql = "'Spend', 'Save', 'Give', 'Hustle', 'Invest', 'Investment'"
+
+    run_query(
+        """
+        alter table public.ledger
+        drop constraint if exists ledger_bucket_check
+        """
+    )
+    run_query(
+        f"""
+        alter table public.ledger
+        add constraint ledger_bucket_check
+        check (
+            (from_bucket is null or from_bucket in ({valid_bucket_sql}))
+            and
+            (to_bucket is null or to_bucket in ({valid_bucket_sql}))
+        )
+        not valid
+        """
+    )
+
+    run_query(
+        """
+        alter table public.ledger
+        drop constraint if exists ledger_transfer_rules
+        """
+    )
+    run_query(
+        f"""
+        alter table public.ledger
+        add constraint ledger_transfer_rules
+        check (
+            (
+                entry_type = 'Transfer'
+                and amount > 0
+                and from_bucket in ({valid_bucket_sql})
+                and to_bucket in ({valid_bucket_sql})
+                and from_bucket <> to_bucket
+            )
+            or
+            (
+                entry_type in ('Allowance', 'Bonus', 'Adjustment')
+                and from_bucket is null
+                and to_bucket in ({valid_bucket_sql})
+                and amount <> 0
+            )
+        )
+        not valid
+        """
+    )
 
 
-def bucket_to_db(bucket):
-    return BUCKET_DB_VALUES.get(bucket, bucket)
+def bucket_for_db(bucket):
+    """Translate UI bucket labels to database bucket values."""
+    bucket = str(bucket or "").strip()
+    if bucket in {"Invest", "Investment"}:
+        return "Hustle"
+    return bucket
 
 
-def bucket_to_display(bucket):
-    return BUCKET_DISPLAY_LABELS.get(bucket, bucket)
+def bucket_for_display(bucket):
+    """Translate legacy/internal bucket names back to friendly UI labels."""
+    bucket = str(bucket or "").strip()
+    if bucket in {"Investment", "Invest", "Hustle"}:
+        return "Hustle"
+    return bucket
+
+
+def add_adjustment_ledger(kid, amount, bucket, comment=""):
+    """Save an adjustment using the database's Adjustment rule.
+
+    Adjustment rows always use to_bucket. Positive amounts increase the bucket;
+    negative amounts reduce the bucket. Do not use from_bucket for Adjustment,
+    because ledger_transfer_rules rejects that pattern.
+    """
+    amount = round(float(amount), 2)
+    db_bucket = bucket_for_db(bucket)
+
+    if amount == 0:
+        return False
+
+    return add_ledger(
+        kid,
+        "Adjustment",
+        amount,
+        from_bucket=None,
+        to_bucket=db_bucket,
+        comment=comment,
+    )
 
 
 
@@ -1193,11 +1255,18 @@ def kid_picker(kids, label="Which kid?"):
 # Require PIN before loading data or posting allowance.
 require_pin()
 
+try:
+    ensure_hustle_bucket_schema()
+except Exception as e:
+    st.error("Database setup failed while enabling the Hustle bucket. See app logs for details.")
+    print("HUSTLE SCHEMA SETUP ERROR:", e)
+    st.stop()
+
 kids = load_kids()
 balances = load_balances()
 
 st.markdown("<h1>PIERCE FAMILY ALLOWANCE</h1>", unsafe_allow_html=True)
-st.markdown(f'<div class="build-tag">Build: {APP_BUILD}</div>', unsafe_allow_html=True)
+st.caption(f"Build: {APP_BUILD}")
 
 last_allowance_posted = get_last_allowance_posted()
 next_allowance_due = get_next_allowance_due_date(last_allowance_posted)
@@ -1284,8 +1353,7 @@ elif page == "ACTIVITY":
 
     if st.session_state.pop("activity_saved", False):
         reset_activity_form()
-        saved_msg = st.session_state.pop("activity_saved_message", "Transaction saved.")
-        st.success(saved_msg)
+        st.success("Transaction saved.")
 
     if kids.empty:
         st.warning("Add at least one kid in Family Settings first.")
@@ -1339,7 +1407,7 @@ elif page == "ACTIVITY":
                 amount = parse_amount(amount_text)
                 comment = st.text_input("Comment", value="", key="transfer_comment")
 
-                if st.button("SAVE", key="transfer_save_button"):
+                if st.button("SAVE", key="save_transfer_button"):
                     if amount is None:
                         st.warning("Enter a valid amount.")
                     elif add_ledger(kid, "Transfer", amount, from_bucket=from_bucket, to_bucket=to_bucket, comment=comment):
@@ -1362,7 +1430,7 @@ elif page == "ACTIVITY":
                 amount = parse_amount(amount_text)
                 comment = st.text_input("Comment", value="", key="bonus_comment")
 
-                if st.button("SAVE", key="bonus_save_button"):
+                if st.button("SAVE", key="save_bonus_button"):
                     if amount is None:
                         st.warning("Enter a valid amount.")
                     elif add_ledger(kid, "Bonus", amount, to_bucket=bucket, comment=comment):
@@ -1385,20 +1453,20 @@ elif page == "ACTIVITY":
                 amount = parse_amount(amount_text)
                 comment = st.text_input("Comment", value="", key="adjustment_comment")
 
-                if st.button("SAVE", key="adjustment_save_button"):
+                if st.button("SAVE", key="save_adjustment_button"):
                     if amount is None:
                         st.warning("Enter a valid amount.")
                     else:
-                        db_bucket = bucket_to_db(bucket)
-                        saved = add_ledger(kid, "Adjustment", amount, to_bucket=db_bucket, comment=comment)
-
-                        if saved:
-                            st.session_state.activity_saved = True
-                            st.session_state.activity_saved_message = f"Saved {bucket} adjustment of ${amount:,.2f}."
-                            reset_activity_form()
-                            st.rerun()
-                        else:
-                            st.warning("Enter a positive or negative amount before saving.")
+                        try:
+                            if add_adjustment_ledger(kid, amount, bucket, comment=comment):
+                                st.session_state.activity_saved = True
+                                reset_activity_form()
+                                st.rerun()
+                            else:
+                                st.warning("Enter a positive or negative amount before saving.")
+                        except Exception as e:
+                            st.error("Adjustment save failed. See app logs for details.")
+                            print("ADJUSTMENT SAVE ERROR:", e)
 
 elif page == "FAMILY SETTINGS":
     
@@ -1422,7 +1490,7 @@ elif page == "FAMILY SETTINGS":
         disabled=["kid_id"],
     )
 
-    if st.button("SAVE", key="family_settings_save_button"):
+    if st.button("SAVE", key="save_family_settings_button"):
         save_kids(edited)
         st.success("Family settings saved.")
         st.rerun()
@@ -1447,6 +1515,9 @@ elif page == "LEDGER":
         if kid_filter != "All":
             selected_name = kid_filter.split(" ", 1)[1]
             show = show[show["kid_name"] == selected_name]
+
+        show["from_bucket"] = show["from_bucket"].apply(bucket_for_display)
+        show["to_bucket"] = show["to_bucket"].apply(bucket_for_display)
 
         ledger_display = show[["entry_date", "kid_name", "entry_type", "amount", "from_bucket", "to_bucket", "comment"]].rename(
             columns={
