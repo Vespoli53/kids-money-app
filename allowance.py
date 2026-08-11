@@ -1,12 +1,11 @@
-import calendar
 import hashlib
-import re
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError
 
 
 st.set_page_config(
@@ -16,7 +15,8 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-APP_BUILD = "hustle-adjustment-v10-transfer-rule-schema-fix-2026-05-27"
+APP_BUILD = "performance-and-reliability-2026-08-11"
+LEDGER_ROW_LIMIT = 500
 
 
 st.markdown("""
@@ -46,13 +46,9 @@ html, body, [data-testid="stAppViewContainer"], .stApp, section.main {
 
 
 /* ===== GLOBAL FONT OVERRIDE ===== */
-@import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700;800;900&display=swap');
-
 html,
 body,
-body *,
 div,
-span,
 p,
 label,
 input,
@@ -66,7 +62,6 @@ select,
 [data-testid="stDataFrame"],
 [data-testid="stDataEditor"],
 .stApp,
-.stApp *,
 .nav-pill,
 .kid-card,
 .kid-card *,
@@ -74,7 +69,14 @@ select,
 .balance-box *,
 .activity-detail-title,
 .activity-to-text {
-    font-family: 'Roboto', Arial, sans-serif !important;
+    font-family: 'Segoe UI', Arial, sans-serif !important;
+}
+
+/* Streamlit renders its password eye as a Material Symbols ligature. Do not
+   let the app font override turn that ligature into the word "visibility". */
+.material-symbols-rounded,
+[data-testid="stIconMaterial"] {
+    font-family: 'Material Symbols Rounded' !important;
 }
 
 .block-container {
@@ -682,7 +684,12 @@ def get_engine():
     if not db_url:
         st.error("DATABASE_URL is missing from .streamlit/secrets.toml.")
         st.stop()
-    return create_engine(db_url, pool_pre_ping=True, pool_recycle=300)
+    return create_engine(
+        db_url,
+        pool_pre_ping=True,
+        pool_recycle=300,
+        connect_args={"connect_timeout": 10},
+    )
 
 
 def run_query(sql, params=None, retries=3, delay=2):
@@ -692,10 +699,16 @@ def run_query(sql, params=None, retries=3, delay=2):
         try:
             with engine.begin() as conn:
                 return conn.execute(text(sql), params or {})
-        except Exception as e:
+        except OperationalError:
             if attempt == retries - 1:
                 raise
-            time.sleep(delay)
+            engine.dispose()
+            time.sleep(delay * (attempt + 1))
+
+
+def clear_data_cache():
+    """Invalidate database-backed reads after a successful write."""
+    st.cache_data.clear()
 
 
 
@@ -743,6 +756,7 @@ def require_pin():
     st.stop()
 
 
+@st.cache_data(ttl=15, show_spinner=False)
 def load_kids():
     engine = get_engine()
     query = """
@@ -760,6 +774,7 @@ def load_kids():
     return pd.read_sql(query, engine)
 
 
+@st.cache_data(ttl=15, show_spinner=False)
 def load_balances():
     engine = get_engine()
     query = """
@@ -795,9 +810,10 @@ def load_balances():
     return pd.read_sql(query, engine)
 
 
+@st.cache_data(ttl=15, show_spinner=False)
 def load_ledger():
     engine = get_engine()
-    query = """
+    query = f"""
         select
             l.entry_id::text as entry_id,
             l.entry_ts as timestamp,
@@ -812,6 +828,7 @@ def load_ledger():
         join public.kids k
             on k.kid_id = l.kid_id
         order by l.entry_ts desc, l.entry_date desc
+        limit {LEDGER_ROW_LIMIT}
     """
     return pd.read_sql(query, engine)
 
@@ -819,18 +836,27 @@ def load_ledger():
 def save_kids(edited_df):
     existing = load_kids()
     existing_ids = set(existing["kid_id"].astype(str))
+    engine = get_engine()
 
-    for _, row in edited_df.iterrows():
-        kid_id = str(row.get("kid_id", "")).strip()
-        name = str(row.get("name", "")).strip() or "Kid"
-        icon = str(row.get("icon", "")).strip() or "🧒"
-        display_order = int(row.get("display_order", 0) or 0)
-        allowance = float(row.get("allowance", 0) or 0)
-        save_percent = float(row.get("save_percent", 0) or 0)
+    with engine.begin() as conn:
+        for _, row in edited_df.iterrows():
+            kid_id = str(row.get("kid_id", "")).strip()
+            name = str(row.get("name", "")).strip() or "Kid"
+            icon = str(row.get("icon", "")).strip() or "🧒"
+            display_order = int(row.get("display_order", 0) or 0)
+            allowance = float(row.get("allowance", 0) or 0)
+            save_percent = float(row.get("save_percent", 0) or 0)
+            values = {
+                "kid_id": kid_id,
+                "display_order": display_order,
+                "name": name,
+                "icon": icon,
+                "allowance": allowance,
+                "save_percent": save_percent,
+            }
 
-        if kid_id and kid_id in existing_ids:
-            run_query(
-                """
+            if kid_id and kid_id in existing_ids:
+                conn.execute(text("""
                 update public.kids
                 set
                     display_order = :display_order,
@@ -839,34 +865,18 @@ def save_kids(edited_df):
                     twice_monthly_allowance = :allowance,
                     save_percent = :save_percent
                 where kid_id = :kid_id
-                """,
-                {
-                    "kid_id": kid_id,
-                    "display_order": display_order,
-                    "name": name,
-                    "icon": icon,
-                    "allowance": allowance,
-                    "save_percent": save_percent,
-                },
-            )
-        else:
-            run_query(
-                """
+                """), values)
+            else:
+                conn.execute(text("""
                 insert into public.kids (
                     display_order, name, icon, twice_monthly_allowance, save_percent
                 )
                 values (
                     :display_order, :name, :icon, :allowance, :save_percent
                 )
-                """,
-                {
-                    "display_order": display_order,
-                    "name": name,
-                    "icon": icon,
-                    "allowance": allowance,
-                    "save_percent": save_percent,
-                },
-            )
+                """), values)
+
+    clear_data_cache()
 
 
 def add_ledger(kid, entry_type, amount, from_bucket=None, to_bucket=None, comment=""):
@@ -894,6 +904,8 @@ def add_ledger(kid, entry_type, amount, from_bucket=None, to_bucket=None, commen
         },
     )
 
+    clear_data_cache()
+
     return True
 
 
@@ -902,6 +914,7 @@ def is_allowance_day(d):
     return d.weekday() == 6
 
 
+@st.cache_data(ttl=15, show_spinner=False)
 def get_last_allowance_posted():
     engine = get_engine()
 
@@ -917,11 +930,8 @@ def get_last_allowance_posted():
         ).scalar()
 
 
-def get_next_allowance_due_date(last_posted=None):
+def get_next_allowance_due_date(last_posted):
     today = date.today()
-
-    if last_posted is None:
-        last_posted = get_last_allowance_posted()
 
     if last_posted is None:
         check = today
@@ -935,8 +945,7 @@ def get_next_allowance_due_date(last_posted=None):
     return check
 
 
-def allowance_periods_due():
-    last_posted = get_last_allowance_posted()
+def allowance_periods_due(last_posted):
     today = date.today()
 
     if last_posted is None:
@@ -1036,6 +1045,9 @@ def post_weekly_allowance_for_period(period_date):
 
             posted_any = True
 
+    if posted_any:
+        clear_data_cache()
+
     return posted_any
 
 
@@ -1079,74 +1091,11 @@ def parse_amount(value):
         return None
 
 
-def ensure_hustle_bucket_schema():
-    """Make sure the ledger constraints match the app's Hustle bucket behavior.
-
-    There are two separate database rules involved:
-    1. ledger_bucket_check controls which bucket names are allowed.
-    2. ledger_transfer_rules controls which entry types may use from_bucket/to_bucket.
-
-    Hustle must be allowed by both rules. Adjustment rows always use to_bucket
-    with a signed amount. Positive adjustments increase the bucket; negative
-    adjustments reduce it. They do not use from_bucket.
-    """
-    valid_bucket_sql = "'Spend', 'Save', 'Give', 'Hustle', 'Invest', 'Investment'"
-
-    run_query(
-        """
-        alter table public.ledger
-        drop constraint if exists ledger_bucket_check
-        """
-    )
-    run_query(
-        f"""
-        alter table public.ledger
-        add constraint ledger_bucket_check
-        check (
-            (from_bucket is null or from_bucket in ({valid_bucket_sql}))
-            and
-            (to_bucket is null or to_bucket in ({valid_bucket_sql}))
-        )
-        not valid
-        """
-    )
-
-    run_query(
-        """
-        alter table public.ledger
-        drop constraint if exists ledger_transfer_rules
-        """
-    )
-    run_query(
-        f"""
-        alter table public.ledger
-        add constraint ledger_transfer_rules
-        check (
-            (
-                entry_type = 'Transfer'
-                and amount > 0
-                and from_bucket in ({valid_bucket_sql})
-                and to_bucket in ({valid_bucket_sql})
-                and from_bucket <> to_bucket
-            )
-            or
-            (
-                entry_type in ('Allowance', 'Bonus', 'Adjustment')
-                and from_bucket is null
-                and to_bucket in ({valid_bucket_sql})
-                and amount <> 0
-            )
-        )
-        not valid
-        """
-    )
-
-
 def bucket_for_db(bucket):
-    """Translate UI bucket labels to database bucket values."""
+    """Use the legacy value accepted by both old and migrated databases."""
     bucket = str(bucket or "").strip()
-    if bucket in {"Invest", "Investment"}:
-        return "Hustle"
+    if bucket in {"Hustle", "Invest", "Investment"}:
+        return "Invest"
     return bucket
 
 
@@ -1255,22 +1204,16 @@ def kid_picker(kids, label="Which kid?"):
 # Require PIN before loading data or posting allowance.
 require_pin()
 
-try:
-    ensure_hustle_bucket_schema()
-except Exception as e:
-    st.error("Database setup failed while enabling the Hustle bucket. See app logs for details.")
-    print("HUSTLE SCHEMA SETUP ERROR:", e)
-    st.stop()
-
-kids = load_kids()
-balances = load_balances()
+page = get_current_page()
+kids = load_kids() if page in {"ACTIVITY", "FAMILY SETTINGS", "LEDGER"} else pd.DataFrame()
+balances = load_balances() if page in {"HOME", "ACTIVITY"} else pd.DataFrame()
 
 st.markdown("<h1>PIERCE FAMILY ALLOWANCE</h1>", unsafe_allow_html=True)
 st.caption(f"Build: {APP_BUILD}")
 
 last_allowance_posted = get_last_allowance_posted()
 next_allowance_due = get_next_allowance_due_date(last_allowance_posted)
-periods_due = allowance_periods_due()
+periods_due = allowance_periods_due(last_allowance_posted)
 
 status_parts = []
 if last_allowance_posted:
@@ -1302,7 +1245,6 @@ if st.button("POST ALLOWANCE", key="post_allowance_button"):
         st.error("Allowance posting failed. Try again.")
         print("POST ALLOWANCE ERROR:", e)
 
-page = get_current_page()
 render_nav(page)
 st.markdown('<div class="nav-divider"></div>', unsafe_allow_html=True)
 
@@ -1471,13 +1413,15 @@ elif page == "ACTIVITY":
 elif page == "FAMILY SETTINGS":
     
     
-    edit_kids = kids.copy().drop(columns=[col for col in ["kid_id", "save_percent"] if col in kids.columns])
+    edit_kids = kids.copy()
     edited = st.data_editor(
         edit_kids,
         hide_index=True,
         width="stretch",
         column_config={
-                        "display_order": st.column_config.NumberColumn("Order", min_value=0, step=1),
+            "kid_id": None,
+            "save_percent": None,
+            "display_order": st.column_config.NumberColumn("Order", min_value=0, step=1),
             "name": st.column_config.TextColumn("Name"),
             "icon": st.column_config.TextColumn("Icon"),
             "allowance": st.column_config.NumberColumn(
@@ -1486,8 +1430,8 @@ elif page == "FAMILY SETTINGS":
                 step=1.0,
                 format="$%.2f",
             ),
-                    },
-        disabled=["kid_id"],
+        },
+        disabled=["kid_id", "save_percent"],
     )
 
     if st.button("SAVE", key="save_family_settings_button"):
@@ -1504,6 +1448,7 @@ elif page == "LEDGER":
     if ledger.empty:
         st.info("No ledger entries yet.")
     else:
+        st.caption(f"Showing the latest {min(len(ledger), LEDGER_ROW_LIMIT)} entries.")
         kid_filter = st.selectbox(
             "Filter kid",
             ["All"] + [f"{row.icon} {row.name}" for row in kids.itertuples()],
@@ -1536,4 +1481,3 @@ elif page == "LEDGER":
             width="stretch",
             hide_index=True,
         )
-
