@@ -15,7 +15,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-APP_BUILD = "performance-and-reliability-2026-08-11"
+APP_BUILD = "psycopg3-compatibility-2026-09-29"
 LEDGER_ROW_LIMIT = 500
 
 
@@ -680,10 +680,19 @@ div[data-testid="stToolbar"] {visibility: hidden;}
 
 @st.cache_resource
 def get_engine():
-    db_url = st.secrets.get("DATABASE_URL", "")
+    db_url = str(st.secrets.get("DATABASE_URL", "")).strip()
     if not db_url:
         st.error("DATABASE_URL is missing from .streamlit/secrets.toml.")
         st.stop()
+
+    # SQLAlchemy 2.1 changed the default PostgreSQL driver from psycopg2 to
+    # psycopg. Select Psycopg 3 explicitly so dependency upgrades cannot change
+    # which DBAPI this app expects.
+    if db_url.startswith("postgres://"):
+        db_url = db_url.replace("postgres://", "postgresql+psycopg://", 1)
+    elif db_url.startswith("postgresql://"):
+        db_url = db_url.replace("postgresql://", "postgresql+psycopg://", 1)
+
     return create_engine(
         db_url,
         pool_pre_ping=True,
